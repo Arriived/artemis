@@ -1,4 +1,4 @@
-use tokio::sync::broadcast::{self, Sender};
+use tokio::sync::broadcast::{self, error::RecvError, Sender};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{error, info};
@@ -92,6 +92,7 @@ where
                             Ok(_) => {}
                             Err(e) => error!("error executing action: {}", e),
                         },
+                        Err(RecvError::Closed) => break,
                         Err(e) => error!("error receiving action: {}", e),
                     }
                 }
@@ -116,6 +117,7 @@ where
                                 }
                             }
                         }
+                        Err(RecvError::Closed) => break,
                         Err(e) => error!("error receiving event: {}", e),
                     }
                 }
@@ -138,5 +140,66 @@ where
         }
 
         Ok(set)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::CollectorStream;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    struct FiniteCollector;
+
+    #[async_trait]
+    impl Collector<u64> for FiniteCollector {
+        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u64>> {
+            Ok(Box::pin(tokio_stream::iter([1, 2])))
+        }
+    }
+
+    struct EchoStrategy;
+
+    #[async_trait]
+    impl Strategy<u64, u64> for EchoStrategy {
+        async fn sync_state(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn process_event(&mut self, event: u64) -> Vec<u64> {
+            vec![event * 10]
+        }
+    }
+
+    struct RecordingExecutor(mpsc::UnboundedSender<u64>);
+
+    #[async_trait]
+    impl Executor<u64> for RecordingExecutor {
+        async fn execute(&self, action: u64) -> Result<()> {
+            self.0.send(action)?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn consumers_finish_after_collectors_close_without_losing_queued_work() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut engine = Engine::new();
+        engine.add_collector(Box::new(FiniteCollector));
+        engine.add_strategy(Box::new(EchoStrategy));
+        engine.add_executor(Box::new(RecordingExecutor(sender)));
+        let mut tasks = engine.run().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("closed channels must terminate consumers");
+        assert_eq!(receiver.try_recv().unwrap(), 10);
+        assert_eq!(receiver.try_recv().unwrap(), 20);
+        assert!(receiver.try_recv().is_err());
     }
 }
